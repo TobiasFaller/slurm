@@ -60,6 +60,7 @@
 #include "src/common/log.h"
 #include "src/common/macros.h"
 #include "src/common/read_config.h"
+#include "src/common/run_command.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_protocol_interface.h"
@@ -71,6 +72,11 @@
 
 #include "file_bcast.h"
 
+/*
+ * This should likely be detected at build time, but I have not
+ * seen any common systems where this is not the correct path.
+ */
+#define LDD_PATH "/usr/bin/ldd"
 #define MAX_THREADS      8	/* These can be huge messages, so
 				 * only run MAX_THREADS at one time */
 
@@ -85,8 +91,9 @@ static int   _file_bcast(struct bcast_parameters *params,
 			 file_bcast_msg_t *bcast_msg,
 			 job_sbcast_cred_msg_t *sbcast_cred);
 static int   _file_state(struct bcast_parameters *params);
+static int _foreach_shared_object(void *x, void *y);
 static int   _get_job_info(struct bcast_parameters *params);
-
+static int _get_lib_paths(char *filename, List lib_paths);
 
 static int _file_state(struct bcast_parameters *params)
 {
@@ -386,6 +393,142 @@ static int _decompress_data_lz4(file_bcast_msg_t *req)
 #else
 	return -1;
 #endif
+}
+
+/*
+ * IN: char pointer with the filename.
+ * IN/OUT: List of shared object direct and indirect dependencies.
+ *
+ * RET:	SLURM_[SUCCESS|ERROR]
+ */
+static int _get_lib_paths(char *filename, List lib_paths)
+{
+	char **ldd_argv;
+	char *result = NULL;
+	char *lpath = NULL, *lpath_end = NULL;
+	char *tok = NULL, *save_ptr = NULL;
+	int status = SLURM_ERROR, rc = SLURM_SUCCESS;
+
+	if (!filename || !lib_paths) {
+		rc = SLURM_ERROR;
+		goto fini;
+	}
+
+	ldd_argv = xcalloc(3, sizeof(char *));
+	ldd_argv[0] = xstrdup("ldd");
+	ldd_argv[1] = xstrdup(filename);
+	/* Already zero'd out after xcalloc(), but make it NULL explicitly */
+	ldd_argv[2] = NULL;
+
+	/*
+	 * NOTE: If using ldd ends up causing problems it is possible to
+	 * leverage using other alternatives for ELF inspection like dlinfo(),
+	 * libelf/gelf libraries or others. This would require recursing in
+	 * search for non-direct dependencies and knowing where to find them by
+	 * doing something similar to the search order of the dynamic linker.
+	 */
+	result = run_command("ldd", LDD_PATH, ldd_argv, NULL, 5000, 0, &status);
+	free_command_argv(ldd_argv);
+
+	if (status) {
+		error("Cannot autodetect libraries for '%s' with ldd command",
+		      filename);
+		rc = SLURM_ERROR;
+		goto fini;
+	} else if (!result) {
+		verbose("ldd exited normally but returned no libraries");
+		rc = SLURM_SUCCESS;
+		goto fini;
+	}
+
+	tok = strtok_r(result, "\n", &save_ptr);
+	while (tok) {
+		if ((lpath = xstrstr(tok, "/"))) {
+			if ((lpath_end = xstrstr(lpath, " "))) {
+				*lpath_end = '\0';
+				list_append(lib_paths, xstrdup(lpath));
+			}
+		}
+		tok = strtok_r(NULL, "\n", &save_ptr);
+	}
+
+fini:
+	xfree(result);
+	return rc;
+}
+
+/*
+ * ListForF to attempt to bcast a shared object.
+ *
+ * IN:	x, list data
+ * IN:	y, arguments
+ * RET:	-1 on error, 0 on success
+ */
+static int _foreach_shared_object(void *x, void *y)
+{
+	foreach_shared_object_t *args = (foreach_shared_object_t *) y;
+	xfree(args->params->src_fname);
+	args->params->src_fname = xstrdup((char *) x);
+	char *dst_basename = NULL, *src_fname_copy = NULL;
+
+	src_fname_copy = xstrdup(args->params->src_fname);
+	dst_basename = xbasename(src_fname_copy);
+	xfree(args->params->dst_fname);
+	xstrfmtcat(args->params->dst_fname, "%s/%s", args->bcast_cache_dir,
+		   dst_basename);
+
+	args->return_code = bcast_file(args->params);
+	xfree(src_fname_copy);
+
+	if (args->return_code != SLURM_SUCCESS) {
+		error("Broadcast of '%s' failed", args->params->src_fname);
+		return -1;
+	}
+
+	verbose("Broadcast shared object src:'%s' dst:'%s' succeeded (%d/%d)",
+		args->params->src_fname, args->params->dst_fname,
+		++args->bcast_sent_cnt, args->bcast_total_cnt);
+
+	return 0;
+}
+
+/*
+ * IN/OUT: bcast_parameters pointer
+ *
+ * RET: SLURM_[ERROR|SUCCESS]
+ */
+extern int bcast_shared_objects(struct bcast_parameters *params)
+{
+	foreach_shared_object_t args;
+	int rc;
+	List lib_paths = NULL;
+
+	xassert(params);
+
+	memset(&args, 0, sizeof(args));
+	lib_paths = list_create(xfree_ptr);
+	if ((rc = _get_lib_paths(params->src_fname, lib_paths)) !=
+	    SLURM_SUCCESS)
+		goto fini;
+
+	if (!(args.bcast_total_cnt = list_count(lib_paths))) {
+		verbose("No shared objects detected for '%s'",
+			params->src_fname);
+		goto fini;
+	}
+
+	params->flags |= BCAST_FLAG_SHARED_OBJECT;
+	excl_paths = _fill_in_excluded_paths(params);
+	args.bcast_cache_dir = xdirname(params->dst_fname);
+	args.params = params;
+	args.return_code = rc;
+
+	list_for_each(lib_paths, _foreach_shared_object, &args);
+	rc = args.return_code;
+
+fini:
+	FREE_NULL_LIST(lib_paths);
+	return rc;
 }
 
 extern int bcast_file(struct bcast_parameters *params)
