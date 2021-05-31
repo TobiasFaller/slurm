@@ -521,10 +521,12 @@ extern int bcast_shared_objects(struct bcast_parameters *params)
 	excl_paths = _fill_in_excluded_paths(params);
 	args.bcast_cache_dir = xdirname(params->dst_fname);
 	args.params = params;
+	args.excluded_paths = excl_paths;
 	args.return_code = rc;
 
 	list_for_each(lib_paths, _foreach_shared_object, &args);
 	rc = args.return_code;
+	params->flags &= ~BCAST_FLAG_SHARED_OBJECT;
 
 fini:
 	FREE_NULL_LIST(lib_paths);
