@@ -3373,7 +3373,6 @@ static int _build_node_list(job_record_t *job_ptr,
 		}
 	}
 
-
 	if (detail_ptr->exc_node_bitmap) {
 		if (usable_node_mask) {
 			bit_and_not(usable_node_mask, detail_ptr->exc_node_bitmap);
@@ -3409,6 +3408,31 @@ static int _build_node_list(job_record_t *job_ptr,
 	while ((config_ptr = list_next(config_iterator))) {
 		bool cpus_ok = false, mem_ok = false, disk_ok = false;
 		bool job_mc_ok = false, config_filter = false;
+
+		/*
+		 * Filter first by selected partition to not overwrite
+		 * error messages from nodes of the selected partition.
+		 * Since nodes can register with more resources than defined
+		 * in the configuration, we want to use those higher values
+		 * for scheduling, but only as needed (slower).
+		 */
+		node_set_ptr[node_set_inx].my_bitmap =
+			bit_copy(config_ptr->node_bitmap);
+		bit_and(node_set_ptr[node_set_inx].my_bitmap,
+			part_ptr->node_bitmap);
+		if (usable_node_mask) {
+			bit_and(node_set_ptr[node_set_inx].my_bitmap,
+				usable_node_mask);
+		}
+		node_set_ptr[node_set_inx].node_cnt =
+			bit_set_count(node_set_ptr[node_set_inx].my_bitmap);
+		if (node_set_ptr[node_set_inx].node_cnt == 0) {
+			debug2("%s: JobId=%u matched 0 nodes (%s) due to job partition or features",
+			       __func__, job_ptr->job_id, config_ptr->nodes);
+			FREE_NULL_BITMAP(node_set_ptr[node_set_inx].my_bitmap);
+			continue;
+		}
+
 		total_cores = config_ptr->tot_sockets * config_ptr->cores;
 		adj_cpus = adjust_cpus_nppcu(_get_ntasks_per_core(detail_ptr),
 					     detail_ptr->cpus_per_task,
@@ -3430,29 +3454,8 @@ static int _build_node_list(job_record_t *job_ptr,
 		     ((mc_ptr->threads_per_core <= config_ptr->threads) ||
 		      (mc_ptr->threads_per_core == NO_VAL16))))
 			job_mc_ok = true;
-		config_filter = !(cpus_ok && mem_ok && disk_ok && job_mc_ok);
-		/*
-		 * since nodes can register with more resources than defined
-		 * in the configuration, we want to use those higher values
-		 * for scheduling, but only as needed (slower)
-		 */
-		node_set_ptr[node_set_inx].my_bitmap =
-			bit_copy(config_ptr->node_bitmap);
-		bit_and(node_set_ptr[node_set_inx].my_bitmap,
-			part_ptr->node_bitmap);
-		if (usable_node_mask) {
-			bit_and(node_set_ptr[node_set_inx].my_bitmap,
-				usable_node_mask);
-		}
-		node_set_ptr[node_set_inx].node_cnt =
-			bit_set_count(node_set_ptr[node_set_inx].my_bitmap);
-		if (node_set_ptr[node_set_inx].node_cnt == 0) {
-			debug2("%s: JobId=%u matched 0 nodes (%s) due to job partition or features",
-			       __func__, job_ptr->job_id, config_ptr->nodes);
-			FREE_NULL_BITMAP(node_set_ptr[node_set_inx].my_bitmap);
-			continue;
-		}
 
+		config_filter = !(cpus_ok && mem_ok && disk_ok && job_mc_ok);
 		if (config_filter) {
 			_set_err_msg(cpus_ok, mem_ok, disk_ok, job_mc_ok,
 				     err_msg);
